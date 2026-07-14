@@ -157,6 +157,8 @@ def split_long_segments(segments: list[dict], max_duration: float = 10.0) -> lis
 
 
 def save_transcript(segments: list[dict], output_path: str) -> str:
+    import os
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(segments, f, ensure_ascii=False, indent=2)
     logger.info(f"Transcript saved: {output_path}")

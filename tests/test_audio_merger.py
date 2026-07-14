@@ -108,7 +108,7 @@ def test_merge_segments_applies_background_gain(tmp_path):
     merge_segments([], seg_dir, full_output, total_duration=3.0,
                    background_path=bg_path)
     merge_segments([], seg_dir, quiet_output, total_duration=3.0,
-                   background_path=bg_path, background_gain_db=-12.0)
+                   background_path=bg_path, background_gain_db=-6.0)
 
     full = AudioSegment.from_wav(full_output)
     quiet = AudioSegment.from_wav(quiet_output)

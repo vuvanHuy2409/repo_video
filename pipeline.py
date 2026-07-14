@@ -117,9 +117,26 @@ def parse_args() -> argparse.Namespace:
         help="Skip final video merge (only produce audio + SRT)",
     )
     parser.add_argument(
+        "--burn-subtitles",
+        action="store_true",
+        help="Burn translated subtitles into the output video",
+    )
+    parser.add_argument(
         "--output-dir",
         default=config.OUTPUT_DIR,
         help=f"Output directory (default: {config.OUTPUT_DIR})",
+    )
+    parser.add_argument(
+        "--subtitle-y",
+        type=float,
+        default=72.0,
+        help="Vertical position of subtitles from the top of the video in percentage (0-100, default: 72)",
+    )
+    parser.add_argument(
+        "--subtitle-size",
+        type=int,
+        default=38,
+        help="Font size of subtitles in pixels (default: 38)",
     )
     parser.add_argument(
         "--bg-mode",
@@ -146,6 +163,11 @@ def parse_args() -> argparse.Namespace:
         metavar="WORK_DIR",
         help="Resume a previous run inside the given work directory. "
              "Skips already-completed steps based on cached artifacts.",
+    )
+    parser.add_argument(
+        "--blur-region",
+        default=None,
+        help="Frosted-glass blur region to cover original subtitles. Format: X:Y:W:H in video pixels.",
     )
 
     args = parser.parse_args()
@@ -198,6 +220,17 @@ def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str
     )
 
 
+def _detect_source_lang(text: str, default_lang: str) -> str:
+    """Detect if text is Chinese, Japanese, Korean, or default."""
+    if any('\u4e00' <= c <= '\u9fff' for c in text):
+        return "zh"
+    if any('\u3040' <= c <= '\u30ff' for c in text):
+        return "ja"
+    if any('\uac00' <= c <= '\ud7a3' for c in text):
+        return "ko"
+    return default_lang
+
+
 def run_pipeline(
     url: str | None,
     file_path: str | None,
@@ -208,6 +241,10 @@ def run_pipeline(
     resume_dir: str | None = None,
     bg_mode: str = "demucs",
     bg_duck_db: float = -12.0,
+    burn_subtitles: bool = False,
+    subtitle_y: float = 72.0,
+    subtitle_size: int = 38,
+    blur_region: tuple | None = None,
 ) -> dict:
     start_time = time.time()
 
@@ -217,12 +254,12 @@ def run_pipeline(
     if resume_dir:
         if not os.path.isdir(resume_dir):
             raise FileNotFoundError(f"Resume directory not found: {resume_dir}")
-        work_dir = resume_dir
+        work_dir = os.path.abspath(resume_dir)
         folder_name = os.path.basename(os.path.normpath(work_dir))
         logger.info(f"Resuming work directory: {work_dir}")
     else:
         folder_name = datetime.now().strftime("%Y%m%d%H%M%S")
-        work_dir = ensure_dir(os.path.join(output_dir, folder_name))
+        work_dir = os.path.abspath(ensure_dir(os.path.join(output_dir, folder_name)))
         logger.info(f"Output folder: {work_dir}")
 
     transcript_orig_path = os.path.join(work_dir, "transcript_original.json")
@@ -282,11 +319,42 @@ def run_pipeline(
     # --- Step 4: Translate to Japanese (manual via skill or web AI) ---
     logger.info("=" * 60)
     logger.info("STEP 4: Loading Japanese translation")
+    
+    is_valid_translation = False
     if os.path.exists(transcript_jp_path):
+        try:
+            with open(transcript_jp_path, encoding="utf-8") as f:
+                temp_segs = json.load(f)
+            if temp_segs and any("text_jp" in s for s in temp_segs):
+                is_valid_translation = True
+                segments = temp_segs
+        except Exception:
+            pass
+
+    if is_valid_translation:
         logger.info(f"Reusing existing translation: {transcript_jp_path}")
-        with open(transcript_jp_path, encoding="utf-8") as f:
-            segments = json.load(f)
+        # Generate the translated SRT file
+        generate_srt(segments, os.path.join(work_dir, "transcript_jp.srt"), text_field="text_jp")
     else:
+        # Automatically translate to pre-fill the translation file!
+        from src.translator import translate_segments_jp
+        try:
+            detected_lang = source_lang
+            if segments:
+                sample_text = " ".join(s.get("text", "") for s in segments[:3])
+                detected_lang = _detect_source_lang(sample_text, source_lang)
+                if detected_lang != source_lang:
+                    logger.info(f"Auto-detected true source language of transcript: {detected_lang} (was {source_lang})")
+                    
+            segments = translate_segments_jp(segments, detected_lang)
+            # Save it so the user has the pre-filled translation!
+            save_transcript(segments, transcript_jp_path)
+            logger.info("Automatic translation completed and saved to transcript_jp.json")
+        except Exception as e:
+            logger.error(f"Automatic translation failed: {e}")
+            # Save a placeholder copy anyway
+            save_transcript(segments, transcript_jp_path)
+            
         _write_translate_pending_hint(work_dir, "ja-JP", source_lang)
         logger.warning("Translation pending — see TRANSLATE_PENDING.txt in work dir")
         return {"status": "translate_pending", "work_dir": work_dir}
@@ -299,7 +367,7 @@ def run_pipeline(
     for seg in segments:
         seg_path = os.path.join(seg_dir, f"seg_{seg['id']:03d}.wav")
         result = synthesize_segment(
-            text_jp=seg["text_jp"],
+            text_jp=seg.get("text_jp", seg.get("text", "")),
             output_path=seg_path,
             target_duration=seg["duration"],
             voice=voice,
@@ -318,7 +386,7 @@ def run_pipeline(
     merge_segments(
         segments, seg_dir, merged_audio_path, total_duration,
         background_path=background_path,
-        background_gain_db=background_gain_db,
+        background_gain_db=0.6,
     )
 
     # --- Step 7: Merge video (optional) ---
@@ -327,7 +395,16 @@ def run_pipeline(
         logger.info("=" * 60)
         logger.info("STEP 7: Creating dubbed video")
         dubbed_video_path = os.path.join(work_dir, "dubbed_video.mp4")
-        merge_video(video_path, merged_audio_path, dubbed_video_path)
+        srt_file = os.path.join(work_dir, "transcript_jp.srt") if burn_subtitles else None
+        merge_video(
+            video_path=video_path,
+            audio_path=merged_audio_path,
+            output_path=dubbed_video_path,
+            srt_path=srt_file,
+            y_pixel=subtitle_y,
+            font_size=subtitle_size,
+            blur_region=blur_region,
+        )
 
     # --- Step 8: Generate thumbnails + YouTube metadata ---
     content_result = {"thumbnails": [], "metadata": {}}
@@ -414,6 +491,10 @@ def main():
             resume_dir=args.resume,
             bg_mode=args.bg_mode,
             bg_duck_db=args.bg_duck_db,
+            burn_subtitles=args.burn_subtitles,
+            subtitle_y=args.subtitle_y,
+            subtitle_size=args.subtitle_size,
+            blur_region=tuple(int(v) for v in args.blur_region.split(":")) if args.blur_region else None,
         )
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)

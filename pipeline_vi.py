@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 import time
+import shutil
 from datetime import datetime
 
 import config
@@ -145,14 +146,41 @@ def parse_args() -> argparse.Namespace:
         help="Skip final video merge (only produce audio + SRT)",
     )
     parser.add_argument(
+        "--burn-subtitles",
+        action="store_true",
+        help="Burn translated subtitles into the output video",
+    )
+    parser.add_argument(
+        "--ocr-replace",
+        action="store_true",
+        help="Use OCR to detect original Chinese subtitle zone and replace with Vietnamese text",
+    )
+    parser.add_argument(
         "--output-dir",
         default=_get_default_vi_output_dir(),
         help=f"Output directory (default: ANKO Project/VN)",
     )
     parser.add_argument(
+        "--subtitle-y",
+        type=float,
+        default=72.0,
+        help="Vertical position of subtitles from the top of the video in percentage (0-100, default: 72)",
+    )
+    parser.add_argument(
+        "--subtitle-size",
+        type=int,
+        default=38,
+        help="Font size of subtitles in pixels (default: 38)",
+    )
+    parser.add_argument(
         "--resume",
         metavar="WORK_DIR",
         help="Resume an existing work directory. Steps whose outputs already exist are skipped.",
+    )
+    parser.add_argument(
+        "--blur-region",
+        default=None,
+        help="Frosted-glass blur region to cover original subtitles. Format: X:Y:W:H in video pixels.",
     )
     parser.add_argument(
         "--bg-mode",
@@ -246,6 +274,17 @@ def _resolve_video(work_dir: str, url: str | None, file_path: str | None) -> str
     )
 
 
+def _detect_source_lang(text: str, default_lang: str) -> str:
+    """Detect if text is Chinese, Japanese, Korean, or default."""
+    if any('\u4e00' <= c <= '\u9fff' for c in text):
+        return "zh"
+    if any('\u3040' <= c <= '\u30ff' for c in text):
+        return "ja"
+    if any('\uac00' <= c <= '\ud7a3' for c in text):
+        return "ko"
+    return default_lang
+
+
 def run_pipeline_vi(
     url: str | None,
     file_path: str | None,
@@ -256,6 +295,11 @@ def run_pipeline_vi(
     resume_dir: str | None = None,
     bg_mode: str = "demucs",
     bg_duck_db: float = -12.0,
+    burn_subtitles: bool = False,
+    ocr_replace: bool = False,
+    subtitle_y: float = 72.0,
+    subtitle_size: int = 38,
+    blur_region: tuple | None = None,
 ) -> dict:
     start_time = time.time()
 
@@ -266,12 +310,12 @@ def run_pipeline_vi(
     if resume_dir:
         if not os.path.isdir(resume_dir):
             raise FileNotFoundError(f"Resume directory not found: {resume_dir}")
-        work_dir = resume_dir
+        work_dir = os.path.abspath(resume_dir)
         folder_name = os.path.basename(os.path.normpath(work_dir))
         logger.info(f"Resuming work directory: {work_dir}")
     else:
         folder_name = datetime.now().strftime("%Y%m%d%H%M%S") + "_vi"
-        work_dir = ensure_dir(os.path.join(output_dir, folder_name))
+        work_dir = os.path.abspath(ensure_dir(os.path.join(output_dir, folder_name)))
         logger.info(f"Output folder: {work_dir}")
 
     transcript_orig_path = os.path.join(work_dir, "transcript_original.json")
@@ -336,7 +380,11 @@ def run_pipeline_vi(
         logger.info(f"Reusing existing translation: {transcript_vi_path}")
         with open(transcript_vi_path, encoding="utf-8") as f:
             segments = json.load(f)
+        # Generate the translated SRT file
+        generate_srt(segments, os.path.join(work_dir, "transcript_vi.srt"), text_field="text_vi")
     else:
+        # Save a placeholder copy of the original transcript
+        shutil.copy2(transcript_orig_path, transcript_vi_path)
         _write_translate_pending_hint(work_dir, "vi-VN", source_lang)
         logger.warning("Translation pending — see TRANSLATE_PENDING.txt in work dir")
         return {"status": "translate_pending", "work_dir": work_dir}
@@ -350,6 +398,10 @@ def run_pipeline_vi(
 
     for seg in segments:
         seg_path = os.path.join(seg_dir, f"seg_{seg['id']:03d}.wav")
+        text_to_speak = seg.get("text_vi", seg.get("text", "")).strip()
+        
+
+
         if os.path.exists(seg_path) and os.path.getsize(seg_path) > 0:
             cached = _ASeg.from_wav(seg_path)
             result = {
@@ -364,7 +416,7 @@ def run_pipeline_vi(
             )
         else:
             result = synthesize_segment_vi(
-                text_vi=seg["text_vi"],
+                text_vi=text_to_speak,
                 output_path=seg_path,
                 target_duration=seg["duration"],
                 voice_id=voice_id,
@@ -409,7 +461,7 @@ def run_pipeline_vi(
     merge_segments(
         segments, fit_dir, merged_audio_path, total_duration,
         background_path=background_path,
-        background_gain_db=background_gain_db,
+        background_gain_db=0.5,
     )
 
     # --- Step 7: Merge video (optional) ---
@@ -418,7 +470,37 @@ def run_pipeline_vi(
         logger.info("=" * 60)
         logger.info("STEP 7: Creating dubbed video")
         dubbed_video_path = os.path.join(work_dir, "dubbed_video.mp4")
-        merge_video(video_path, merged_audio_path, dubbed_video_path)
+        srt_vi = os.path.join(work_dir, "transcript_vi.srt")
+        if ocr_replace:
+            from src.video_merger import merge_video_with_ocr_replace
+            merge_video_with_ocr_replace(
+                video_path=video_path,
+                audio_path=merged_audio_path,
+                output_path=dubbed_video_path,
+                srt_path=srt_vi,
+                y_pixel=subtitle_y,
+                font_size=subtitle_size,
+                blur_region=blur_region,
+            )
+        elif burn_subtitles:
+            merge_video(
+                video_path=video_path,
+                audio_path=merged_audio_path,
+                output_path=dubbed_video_path,
+                srt_path=srt_vi,
+                y_pixel=subtitle_y,
+                font_size=subtitle_size,
+                blur_region=blur_region,
+            )
+        else:
+            merge_video(
+                video_path=video_path,
+                audio_path=merged_audio_path,
+                output_path=dubbed_video_path,
+                y_pixel=subtitle_y,
+                font_size=subtitle_size,
+                blur_region=blur_region,
+            )
 
     # --- Step 8: Generate thumbnails + YouTube metadata ---
     content_result = {"thumbnails": [], "metadata": {}}
@@ -506,6 +588,11 @@ def main():
             resume_dir=args.resume,
             bg_mode=args.bg_mode,
             bg_duck_db=args.bg_duck_db,
+            burn_subtitles=args.burn_subtitles,
+            ocr_replace=args.ocr_replace,
+            subtitle_y=args.subtitle_y,
+            subtitle_size=args.subtitle_size,
+            blur_region=tuple(int(v) for v in args.blur_region.split(":")) if args.blur_region else None,
         )
     except Exception as e:
         logger.error(f"Pipeline failed: {e}", exc_info=True)

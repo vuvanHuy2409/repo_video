@@ -25,6 +25,48 @@ playwright install chromium      # cần cho download Douyin
 cp .env.example .env             # rồi điền key vào
 ```
 
+## Hướng dẫn cấu hình file `.env`
+
+Để ứng dụng hoạt động, bạn cần sao chép file `.env.example` thành `.env` và điền đầy đủ các thông tin cấu hình API dưới đây:
+
+### 1. Azure Speech Service (Cần thiết cho Nhận dạng ASR & Lồng tiếng Nhật)
+*   **Tác dụng**: Dùng để chuyển giọng nói trong video thành văn bản (ASR) và lồng tiếng Nhật (TTS).
+*   **Cách lấy API Key & Region**:
+    1. Truy cập [Microsoft Azure Portal](https://portal.azure.com/) và đăng nhập tài khoản.
+    2. Tìm kiếm và chọn dịch vụ **Speech** (hoặc tạo một tài nguyên **Azure Cognitive Services**).
+    3. Chọn gói cước (Gói **Free F0** là đủ cho nhu cầu cá nhân/thử nghiệm, hoặc gói Pay-as-you-go).
+    4. Sau khi tài nguyên được khởi tạo thành công, truy cập vào mục **Keys and Endpoint** ở menu bên trái.
+    5. Sao chép một trong hai Key (`KEY 1` hoặc `KEY 2`) dán vào biến `AZURE_SPEECH_KEY`.
+    6. Sao chép giá trị **Location/Region** (ví dụ: `japaneast`, `eastus`) dán vào biến `AZURE_SPEECH_REGION`.
+
+### 2. Vietnamese TTS - LucyLab API (Cần thiết nếu lồng tiếng Việt)
+*   **Tác dụng**: Dùng để lồng tiếng Việt chất lượng cao bằng giọng đọc AI tự nhiên.
+*   **Cách lấy API Key & Voice ID**:
+    1. Truy cập website lồng tiếng Việt [LucyLab.io](https://lucylab.io/) (hoặc nền tảng VietSpeech).
+    2. Đăng ký tài khoản và đăng nhập.
+    3. Vào mục **API Key / Developer Settings** trong trang cá nhân của bạn để tạo và sao chép mã khóa API. Dán mã này vào biến `VIETNAMESE_API_KEY`.
+    4. Tìm kiếm danh sách Voice ID có sẵn trên LucyLab và dán mã giọng đọc nam vào `VIETNAMESE_VOICEID_MALE` (ví dụ: `2LLtWibYKJaiLFeqVkzPGY`) và mã giọng đọc nữ vào `VIETNAMESE_VOICEID_FEMALE` (ví dụ: `mhsL3CPLxmLYdSTKp3GANz`).
+    5. Giữ nguyên địa chỉ API URL mặc định: `LUCYLAB_API_URL=https://api.lucylab.io/json-rpc`.
+
+### 3. Google Gemini API Key (Tùy chọn)
+*   **Tác dụng**: Dùng để tự động dịch thuật và phân tích video, viết tiêu đề/mô tả/thẻ tag YouTube và tự động tạo gợi ý vẽ hình thu nhỏ (thumbnail prompts).
+*   **Cách lấy API Key**:
+    1. Truy cập [Google AI Studio](https://aistudio.google.com/).
+    2. Đăng nhập bằng tài khoản Google của bạn.
+    3. Nhấp vào nút **Get API Key** ở góc trên cùng bên trái màn hình.
+    4. Tạo một khóa API mới (miễn phí) và sao chép dán vào biến `GOOGLE_API_KEY`.
+
+### 4. Các thông số cấu hình chung khác
+*   `AUDIO_SLOW_FACTOR`: Tỷ lệ làm chậm và kéo dài phần âm thanh nhạc nền gốc (BGM) để tạo không gian trống lồng tiếng nói. Mặc định là `0.82` (chậm đi 18%), giữ nguyên nếu bạn muốn nhạc nền khớp tự nhiên nhất.
+*   `DEFAULT_SOURCE_LANG`: Ngôn ngữ nguồn mặc định của video gốc (ví dụ: `en-US` cho tiếng Anh, `zh-CN` cho tiếng Trung).
+*   `TTS_VOICE`: Tên mẫu giọng đọc tiếng Nhật mặc định sử dụng từ Azure (mặc định: `ja-JP-KeitaNeural`).
+*   `TTS_MAX_SPEED_RATIO`: Giới hạn tỷ lệ tăng tốc tối đa của giọng đọc tiếng Nhật (mặc định: `1.3`).
+*   `VIETNAMESE_TTS_MAX_SPEED`: Giới hạn tỷ lệ tăng tốc tối đa của giọng đọc tiếng Việt (mặc định: `1.3`).
+*   `AUDIO_SAMPLE_RATE`: Tần số lấy mẫu âm thanh phục vụ nhận dạng (mặc định: `16000`).
+*   `OUTPUT_DIR`: Thư mục chứa thư mục làm việc và video thành phẩm kết xuất ra (mặc định: `./output`).
+
+---
+
 ## Hai cách dịch — chọn 1
 
 Bước dịch transcript là bước **duy nhất** cần can thiệp tay. Sau khi ASR xong, pipeline tự dừng và tạo file `TRANSLATE_PENDING.txt` trong work dir, chứa hướng dẫn cụ thể cho cả 2 cách dưới.

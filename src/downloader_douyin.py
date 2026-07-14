@@ -37,7 +37,7 @@ _DASH_VIDEO_RE = re.compile(r"/media-video-")
 _DASH_AUDIO_RE = re.compile(r"/media-audio-")
 _CDN_HOST_RE = re.compile(r"\.(zjcdn|douyinvod|douyincdn)\.com|\.bytecdntp\.com")
 _VIDEO_MIME_RE = re.compile(r"mime_type=video_mp4")
-_VIDEO_ID_RE = re.compile(r"/video/(\d+)")
+_VIDEO_ID_RE = re.compile(r"/(?:video|note)/(\d+)|modal_id=(\d+)")
 
 
 def is_douyin_url(url: str) -> bool:
@@ -58,17 +58,17 @@ def _bitrate_of(url: str) -> int:
 def _extract_via_playwright(
     url: str,
     wait_seconds: float = 20.0,
-    headless: bool = True,
+    headless: bool | None = None,
 ) -> dict:
     """Open the Douyin page and capture direct CDN URLs for video + audio.
 
-    Douyin detects vanilla headless Chromium and refuses to start the player
-    (the browser sits on the page but never fetches media segments). We launch
-    with `--disable-blink-features=AutomationControlled` and a fully populated
-    UA + viewport to look like a real browser. If that still fails on a
-    particular host, callers can pass `headless=False` to fall back to a
-    visible window.
+    Douyin detects vanilla headless Chromium and refuses to start the player.
+    We default to headful (headless=False) on macOS and Windows to easily bypass
+    anti-bot detection, and headless on Linux.
     """
+    if headless is None:
+        import platform
+        headless = platform.system() == "Linux"
     launch_args = [
         "--disable-blink-features=AutomationControlled",
         "--disable-features=IsolateOrigins,site-per-process",
@@ -102,7 +102,10 @@ def _extract_via_playwright(
         page.on("request", on_request)
 
         logger.info(f"Loading Douyin page: {url}")
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as e:
+            logger.warning(f"page.goto encountered warning/timeout: {e}. Checking captured requests...")
 
         deadline = time.time() + wait_seconds
         while time.time() < deadline:
@@ -122,7 +125,9 @@ def _extract_via_playwright(
     )
 
     m = _VIDEO_ID_RE.search(canonical)
-    video_id = m.group(1) if m else ""
+    video_id = ""
+    if m:
+        video_id = m.group(1) or m.group(2) or ""
 
     if captured["progressive"]:
         return {
@@ -207,7 +212,16 @@ def download_douyin(
     ensure_dir(output_dir)
 
     info = _extract_via_playwright(url)
-    video_id = info["video_id"] or "unknown"
+    video_id = info["video_id"]
+    if not video_id:
+        canonical_lower = info["canonical_url"].lower()
+        if "login" in canonical_lower or "discover" in canonical_lower or ("jingxuan" in canonical_lower and "modal_id" not in canonical_lower):
+            raise RuntimeError(
+                f"Douyin redirected the request to an explore/login page (canonical={info['canonical_url']}). "
+                "This usually happens when automated access is blocked by captcha or login walls. "
+                "Please download the video file manually and select it via 'Chọn file video' in the GUI."
+            )
+        video_id = "unknown"
 
     out_dir = Path(output_dir)
     name = filename or f"Douyin_{video_id}.mp4"

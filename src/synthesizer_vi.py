@@ -18,21 +18,39 @@ POLL_INTERVAL = 2  # seconds between status checks
 POLL_TIMEOUT = int(os.getenv("LUCYLAB_POLL_TIMEOUT", "300"))  # max seconds to wait for TTS completion
 
 
+def _request_with_retry(func, *args, max_retries=5, delay=2, **kwargs):
+    """General HTTP request wrapper with retries and exponential backoff."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = func(*args, **kwargs)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            if attempt == max_retries:
+                raise e
+            logger.warning(f"LucyLab API request failed (attempt {attempt}/{max_retries}): {e}. Retrying in {delay}s...")
+            time.sleep(delay)
+            delay *= 2
+
+
 def _call_lucylab(method: str, input_data: dict) -> dict:
-    """Call LucyLab JSON-RPC API."""
-    response = requests.post(
+    """Call LucyLab JSON-RPC API with retry mechanism."""
+    headers = {
+        "Authorization": f"Bearer {config.VIETNAMESE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    json_data = {
+        "method": method,
+        "input": input_data,
+    }
+    
+    response = _request_with_retry(
+        requests.post,
         config.LUCYLAB_API_URL,
-        headers={
-            "Authorization": f"Bearer {config.VIETNAMESE_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "method": method,
-            "input": input_data,
-        },
-        timeout=30,
+        headers=headers,
+        json=json_data,
+        timeout=30
     )
-    response.raise_for_status()
     data = response.json()
 
     if "error" in data:
@@ -64,9 +82,12 @@ def _wait_for_audio(export_id: str) -> str:
 
 
 def _download_audio(url: str, output_path: str) -> str:
-    """Download audio file from URL."""
-    response = requests.get(url, timeout=60)
-    response.raise_for_status()
+    """Download audio file from URL with retry mechanism."""
+    response = _request_with_retry(
+        requests.get,
+        url,
+        timeout=60
+    )
 
     with open(output_path, "wb") as f:
         f.write(response.content)
@@ -96,6 +117,21 @@ def synthesize_segment_vi(
     if not config.VIETNAMESE_API_KEY:
         raise ValueError("VIETNAMESE_API_KEY not set in .env")
 
+    import re
+    # If the text has no word characters (punctuation only, whitespace only, or empty),
+    # generate silence proactively to avoid quota costs and API errors.
+    if not re.search(r"\w", text_vi):
+        logger.info(f"Text has no speech content: '{text_vi}'. Generating silent audio.")
+        dur = target_duration if target_duration and target_duration > 0 else 0.5
+        audio = AudioSegment.silent(duration=int(dur * 1000))
+        audio.export(output_path, format="wav")
+        return {
+            "path": output_path,
+            "actual_duration": round(dur, 3),
+            "speed_adjusted": False,
+            "rate_applied": "1.0x",
+        }
+
     max_speed = config.VIETNAMESE_TTS_MAX_SPEED
 
     # --- Step 1: Estimate optimal speed based on text length and target duration ---
@@ -105,7 +141,7 @@ def synthesize_segment_vi(
     # speeding up the audio unnecessarily — users complained the VI voice
     # sounded rushed compared to the original.
     chars_per_sec_normal = 19.0
-    safety_headroom = 1.10
+    safety_headroom = 1.02
     estimated_normal_duration = len(text_vi) / chars_per_sec_normal
 
     speed = 1.0
@@ -117,72 +153,83 @@ def synthesize_segment_vi(
             speed = min(estimated_ratio, max_speed)
             speed = round(speed, 2)
 
-    # --- Step 2: Call TTS API ---
-    logger.info(f"TTS request: {len(text_vi)} chars, speed={speed}, target={target_duration:.1f}s"
-                if target_duration else f"TTS request: {len(text_vi)} chars, speed={speed}")
-
-    result = _call_lucylab("ttsLongText", {
-        "text": text_vi,
-        "userVoiceId": voice_id,
-        "speed": speed,
-    })
-
-    export_id = result.get("projectExportId")
-    if not export_id:
-        raise RuntimeError(f"No projectExportId in response: {result}")
-
-    logger.info(f"TTS job created: {export_id} (chars={result.get('characterCount', '?')}, "
-                f"blocks={result.get('blockCount', '?')})")
-
-    # --- Step 3: Poll for completion and download ---
-    audio_url = _wait_for_audio(export_id)
-    logger.info(f"TTS completed, downloading audio...")
-
-    # Download to a temp file first (API may return mp3 or wav)
-    temp_path = output_path + ".tmp"
-    _download_audio(audio_url, temp_path)
-
-    # Convert to WAV for consistency with the rest of the pipeline
-    audio = AudioSegment.from_file(temp_path)
-    audio.export(output_path, format="wav")
-    os.remove(temp_path)
-
-    actual_duration = len(audio) / 1000.0
+    actual_duration = target_duration if target_duration and target_duration > 0 else 0.5
     speed_adjusted = speed != 1.0
 
-    # --- Step 4: If still too long, we can't re-synthesize easily (API cost),
-    # just log a warning for CapCut adjustment ---
-    if target_duration and actual_duration > target_duration * 1.1:
-        if speed < max_speed:
-            # Try once more with higher speed
-            new_speed = min(actual_duration / target_duration * speed, max_speed)
-            new_speed = round(new_speed, 2)
-            logger.info(
-                f"Re-adjusting speed: {actual_duration:.1f}s → ~{target_duration:.1f}s "
-                f"(speed: {speed} → {new_speed})"
-            )
+    try:
+        # --- Step 2: Call TTS API ---
+        logger.info(f"TTS request: {len(text_vi)} chars, speed={speed}, target={target_duration:.1f}s"
+                    if target_duration else f"TTS request: {len(text_vi)} chars, speed={speed}")
 
-            result2 = _call_lucylab("ttsLongText", {
-                "text": text_vi,
-                "userVoiceId": voice_id,
-                "speed": new_speed,
-            })
+        result = _call_lucylab("ttsLongText", {
+            "text": text_vi,
+            "userVoiceId": voice_id,
+            "speed": speed,
+        })
 
-            export_id2 = result2.get("projectExportId")
-            if export_id2:
-                audio_url2 = _wait_for_audio(export_id2)
-                _download_audio(audio_url2, temp_path)
-                audio = AudioSegment.from_file(temp_path)
-                audio.export(output_path, format="wav")
-                os.remove(temp_path)
-                actual_duration = len(audio) / 1000.0
-                speed = new_speed
-                speed_adjusted = True
-        else:
-            logger.warning(
-                f"Segment too long ({actual_duration:.1f}s vs {target_duration:.1f}s target). "
-                f"Already at max speed {max_speed}x — adjust in CapCut."
-            )
+        export_id = result.get("projectExportId")
+        if not export_id:
+            raise RuntimeError(f"No projectExportId in response: {result}")
+
+        logger.info(f"TTS job created: {export_id} (chars={result.get('characterCount', '?')}, "
+                    f"blocks={result.get('blockCount', '?')})")
+
+        # --- Step 3: Poll for completion and download ---
+        audio_url = _wait_for_audio(export_id)
+        logger.info(f"TTS completed, downloading audio...")
+
+        # Download to a temp file first (API may return mp3 or wav)
+        temp_path = output_path + ".tmp"
+        _download_audio(audio_url, temp_path)
+
+        # Convert to WAV for consistency with the rest of the pipeline
+        audio = AudioSegment.from_file(temp_path)
+        audio.export(output_path, format="wav")
+        os.remove(temp_path)
+
+        actual_duration = len(audio) / 1000.0
+        speed_adjusted = speed != 1.0
+
+        # --- Step 4: If still too long, we can't re-synthesize easily (API cost),
+        # just log a warning for CapCut adjustment ---
+        if target_duration and actual_duration > target_duration * 1.1:
+            if speed < max_speed:
+                # Try once more with higher speed
+                new_speed = min(actual_duration / target_duration * speed, max_speed)
+                new_speed = round(new_speed, 2)
+                logger.info(
+                    f"Re-adjusting speed: {actual_duration:.1f}s → ~{target_duration:.1f}s "
+                    f"(speed: {speed} → {new_speed})"
+                )
+
+                result2 = _call_lucylab("ttsLongText", {
+                    "text": text_vi,
+                    "userVoiceId": voice_id,
+                    "speed": new_speed,
+                })
+
+                export_id2 = result2.get("projectExportId")
+                if export_id2:
+                    audio_url2 = _wait_for_audio(export_id2)
+                    _download_audio(audio_url2, temp_path)
+                    audio = AudioSegment.from_file(temp_path)
+                    audio.export(output_path, format="wav")
+                    os.remove(temp_path)
+                    actual_duration = len(audio) / 1000.0
+                    speed = new_speed
+                    speed_adjusted = True
+            else:
+                logger.warning(
+                    f"Segment too long ({actual_duration:.1f}s vs {target_duration:.1f}s target). "
+                    f"Already at max speed {max_speed}x — adjust in CapCut."
+                )
+    except Exception as e:
+        logger.warning(f"LucyLab TTS failed for segment '{text_vi}' due to error: {e}. Falling back to silent audio.")
+        dur = target_duration if target_duration and target_duration > 0 else 0.5
+        audio = AudioSegment.silent(duration=int(dur * 1000))
+        audio.export(output_path, format="wav")
+        actual_duration = dur
+        speed_adjusted = False
 
     return {
         "path": output_path,
