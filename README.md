@@ -141,3 +141,4 @@ output/VN/20260601120000_vi/
 ## License
 
 MIT.
+# repo_video
